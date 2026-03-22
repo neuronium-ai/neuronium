@@ -1,0 +1,2591 @@
+# Neuronium Agent — Полная системная документация
+ 
+> Версия: 0.1.0 (Alpha)
+> Python: 3.11+
+> Лицензия: MIT
+> Дата компиляции: 2026-03-22
+ 
+---
+ 
+## Оглавление
+ 
+1. [Обзор системы](#1-обзор-системы)
+2. [Архитектурные принципы и инварианты](#2-архитектурные-принципы-и-инварианты)
+3. [Структура проекта](#3-структура-проекта)
+4. [Конфигурация (CONFIG_SPEC)](#4-конфигурация)
+5. [Публичный API (PUBLIC_API_SPEC)](#5-публичный-api)
+6. [Типы данных и DTO](#6-типы-данных-и-dto)
+7. [Иерархия ошибок](#7-иерархия-ошибок)
+8. [Когнитивное ядро (Cognitive Core)](#8-когнитивное-ядро)
+9. [Состояние агента и жизненный цикл](#9-состояние-агента-и-жизненный-цикл)
+10. [Оркестратор](#10-оркестратор)
+11. [Планирование (HTN + DAG)](#11-планирование)
+12. [Action Graph (DAG)](#12-action-graph)
+13. [Система узлов (Nodes)](#13-система-узлов)
+14. [Исполнитель DAG (DAGExecutor)](#14-исполнитель-dag)
+15. [Runbook-система](#15-runbook-система)
+16. [Динамический планировщик](#16-динамический-планировщик)
+17. [Верификация и критики](#17-верификация-и-критики)
+18. [Хранилище (Storage)](#18-хранилище)
+19. [Трассировка и аудит](#19-трассировка-и-аудит)
+20. [Контрольные точки и возобновление](#20-контрольные-точки-и-возобновление)
+21. [Воспроизведение (Replay)](#21-воспроизведение)
+22. [Восстановление после сбоев (Recovery)](#22-восстановление-после-сбоев)
+23. [Протокол управления (Control Protocol)](#23-протокол-управления)
+24. [Память (GraphRAG-lite)](#24-память)
+25. [Инструменты (Tools)](#25-инструменты)
+26. [Каноническая JSON-сериализация](#26-каноническая-json-сериализация)
+27. [Детерминизм и контракты](#27-детерминизм-и-контракты)
+28. [State Patch (RFC6902)](#28-state-patch)
+29. [Каталог операторов](#29-каталог-операторов)
+30. [Каталог моделей](#30-каталог-моделей)
+31. [Артефакты и рендеринг](#31-артефакты-и-рендеринг)
+32. [CLI-интерфейс](#32-cli-интерфейс)
+33. [Очередь задач (Redis + RQ)](#33-очередь-задач)
+34. [Тестирование](#34-тестирование)
+35. [Зависимости](#35-зависимости)
+36. [Дорожная карта](#36-дорожная-карта)
+ 
+---
+ 
+## 1. Обзор системы
+ 
+**Neuronium Agent** — это commitment-aware AI Super Agent с продвинутыми возможностями планирования, исполнения и верификации. Система реализует цикл «Когнитивного Ядра»:
+ 
+```
+COMMIT → EXECUTE → CONTROL → ADAPT
+```
+ 
+### Ключевые возможности
+ 
+- **Оркестрация AI-агента**: HTN-планирование с DAG-исполнением
+- **Детерминизм по умолчанию**: каноническая JSON-сериализация, воспроизведение (replay)
+- **Production-ready**: Postgres/Redis для продакшена, SQLite для локальной разработки
+- **Верификация**: слой «критиков» для контроля качества
+- **Гибридная память**: GraphRAG-lite с графом знаний и agentic retrieval
+- **Полный аудит**: append-only trace, формальные записи решений
+- **Pause/Resume**: контрольные точки на границах фаз
+ 
+### 5 фундаментальных принципов (IBS §1.1.1)
+ 
+1. **Goal-Directed Execution** — целенаправленное исполнение с commitment-семантикой
+2. **Graph-Native Planning** — планирование через DAG (Action Graph)
+3. **Verification-Integrated Control** — встроенная верификация через критиков
+4. **Memory-as-System-Component** — память как первоклассный компонент
+5. **Audit-by-Construction** — аудит встроен в архитектуру
+ 
+---
+ 
+## 2. Архитектурные принципы и инварианты
+ 
+### 3 ненарушимых инварианта (IBS §1.2)
+ 
+#### 2.1 Детерминистическое исполнение (§1.2.1)
+- Одинаковые входные данные + одинаковый seed → одинаковый результат
+- Каноническая JSON-сериализация: отсортированные ключи, без NaN/Infinity, компактные разделители
+- Контракт детерминизма: каждый узел декларирует `uses_seed` и `declared_non_deterministic`
+ 
+#### 2.2 Неизменяемость линейного графа артефактов (§1.2.2)
+- Артефакты идентифицируются хешем содержимого (`sha256:<hex>`)
+- Рёбра линейного графа append-only: никогда не удаляются
+- Логическое удаление через `deprecated_at`
+ 
+#### 2.3 Воспроизводимость (§1.2.3)
+- Все внешние вызовы (LLM, инструменты, код) записываются
+- Strict offline replay: повторное выполнение из записанных данных
+- Seed injection для узлов, использующих случайность
+ 
+---
+ 
+## 3. Структура проекта
+ 
+```
+neuronium/
+├── neuronium_agent/                 # Основной пакет
+│   ├── __init__.py                  # Публичный API re-exports, version="0.1.0"
+│   ├── api.py                       # AgentRunner — главный фасад
+│   ├── config.py                    # Конфигурация (TOML + env + CLI)
+│   ├── types.py                     # Публичные DTO
+│   ├── errors.py                    # Иерархия ошибок
+│   ├── _canonical.py                # Каноническая JSON + content-addressed ID
+│   ├── model_catalog_defaults.py    # Каталог моделей (B13)
+│   │
+│   ├── core/                        # Состояние + оркестрация
+│   │   ├── state.py                 # AgentState, IntentionPhase, RunState
+│   │   └── orchestrator.py          # Когнитивное ядро: COMMIT→EXECUTE→CONTROL→ADAPT
+│   │
+│   ├── planning/                    # HTN планировщик и DAG
+│   │   ├── dag.py                   # ActionGraph, GraphNode, GraphEdge
+│   │   ├── htn.py                   # HTN-шаблоны (iter1/iter2_fix)
+│   │   ├── runbook_contract.py      # Runbook абстракция + StageSuccessGate
+│   │   ├── runbook_registry.py      # Реестр runbook'ов
+│   │   ├── runbooks.py              # DocsReportV1Runbook
+│   │   ├── autofix_demo_runbook.py  # AutofixDemoRunbook
+│   │   ├── dynamic_planner_demo_runbook.py
+│   │   ├── htn_recursive_demo_runbook.py
+│   │   ├── super_agent_runbook.py   # SuperAgentV0Runbook
+│   │   ├── memory_runbook.py        # HybridMemoryReportV1Runbook
+│   │   ├── planner_contract.py      # PlannerRequest / PlannerResult
+│   │   ├── planner_backend.py       # PlannerBackend Protocol
+│   │   ├── htn_recursive_backend.py # HTN recursive backend
+│   │   ├── dynamic_planner.py       # Динамический планировщик
+│   │   ├── operator_catalog.py      # Каталог операторов
+│   │   ├── operator_contracts.py    # Контракты операторов
+│   │   ├── state_patch.py           # RFC6902 JSON Patch
+│   │   ├── missing_slots.py         # Извлечение пропущенных слотов
+│   │   ├── extraction_contract.py   # Контракт извлечения
+│   │   ├── htn_contract.py          # Контракт HTN
+│   │   └── tool_schema_registry.py  # Реестр схем инструментов
+│   │
+│   ├── execution/                   # Детерминистический исполнитель DAG
+│   │   ├── executor.py              # DAGExecutor
+│   │   └── outcome.py               # ExecutionOutcome
+│   │
+│   ├── nodes/                       # Реализации узлов (IBS §6)
+│   │   ├── base.py                  # BaseNode, NodeInput, NodeOutput
+│   │   ├── model_node.py            # ModelNode (LLM через OpenAI)
+│   │   ├── code_node.py             # CodeNode (Python в Docker)
+│   │   ├── mcp_node.py              # McpToolNode (инструменты)
+│   │   ├── decision_node.py         # DecisionNode (ветвление)
+│   │   ├── aggregate_node.py        # AggregateNode (слияние)
+│   │   └── determinism.py           # DeterminismContract
+│   │
+│   ├── storage/                     # Blob store + Index store
+│   │   ├── blob_store.py            # BlobStore (абстракция)
+│   │   ├── fs_cas.py                # FsCasStore (файловая система)
+│   │   ├── index_store.py           # IndexStore (абстракция)
+│   │   ├── sqlite_store.py          # SqliteIndexStore
+│   │   ├── postgres_store.py        # PostgresIndexStore
+│   │   ├── migrator.py              # Мигратор БД
+│   │   └── migrations/              # SQL-миграции (sqlite/ и postgres/)
+│   │
+│   ├── trace/                       # Запись, экспорт, воспроизведение
+│   │   ├── recorder.py              # TraceRecorder (append-only)
+│   │   ├── exporter.py              # TraceExporter (jsonl/json/zip)
+│   │   ├── replay.py                # ReplayProvider
+│   │   ├── checkpoints.py           # Контрольные точки
+│   │   └── decision_record.py       # Формальные записи решений (§10)
+│   │
+│   ├── verification/                # Критики и контроль качества (§7)
+│   │   ├── critic.py                # SimulatedCritic (stub)
+│   │   ├── demo_critic.py           # DemoCriticVerdict
+│   │   ├── business_critic.py       # Бизнес-критик
+│   │   ├── generic_critic.py        # Универсальный критик
+│   │   └── memory_critic.py         # Критик памяти
+│   │
+│   ├── memory/                      # GraphRAG-lite (v0.2)
+│   │   ├── models.py                # MemoryQuery, MemoryResult и др.
+│   │   ├── store.py                 # MemoryStore (абстракция)
+│   │   ├── sqlite_memory_store.py   # SQLite-бэкенд
+│   │   └── postgres_memory_store.py # Postgres-бэкенд
+│   │
+│   ├── recovery/                    # Классификация сбоев и политика (B1, B2)
+│   │   ├── classifier.py            # classify_failure()
+│   │   ├── policy.py                # decide_recovery()
+│   │   ├── models.py                # RecoveryAction, RollbackScope
+│   │   └── scope.py                 # compute_rollback_scope()
+│   │
+│   ├── artifacts/                   # Рендеринг артефактов
+│   │   ├── renderer.py              # render_run_artifact() → HTML
+│   │   ├── user_renderer.py         # render_user_facing_html()
+│   │   └── local_index.py           # LocalArtifactIndex
+│   │
+│   ├── control/                     # Протокол управления
+│   │   └── protocol.py              # ControlProtocol
+│   │
+│   ├── tools/                       # Исполнение инструментов
+│   │   ├── local_tools.py           # invoke_local_tool() — диспетчер
+│   │   ├── memory_tools.py          # memory.ingest_files, memory.query
+│   │   ├── web_tools.py             # web.fetch_html, web.extract_article
+│   │   ├── text_tools.py            # text.extract_entities
+│   │   ├── artifact_tools.py        # artifact.put_json
+│   │   ├── export_tools.py          # export.write_text
+│   │   └── runtime.py               # ToolRuntime контекст
+│   │
+│   ├── queue/                       # Асинхронное исполнение
+│   │   └── rq_runner.py             # Redis + RQ runner
+│   │
+│   ├── schemas/                     # JSON Schema реестр
+│   │   ├── registry.py              # SCHEMA_REGISTRY
+│   │   ├── export.py                # Экспорт схем
+│   │   └── tool_schema_registry.py  # Схемы инструментов
+│   │
+│   └── cli/                         # CLI точки входа
+│       └── main.py                  # Click CLI: run, status, control, replay, worker
+│
+├── tests/                           # ~50 тестовых модулей
+│   ├── conftest.py                  # Общие фикстуры
+│   ├── test_api.py                  # End-to-end тесты
+│   ├── test_canonical.py            # Каноническая сериализация
+│   ├── test_config.py               # Загрузка конфигурации
+│   ├── test_storage.py              # Хранилище
+│   ├── test_determinism.py          # Воспроизводимость
+│   ├── test_executor_*.py           # Тесты исполнителя
+│   ├── test_recovery_*.py           # Тесты восстановления
+│   └── reference_payloads/          # JSON-референсы
+│
+├── docs/                            # Архитектура и спецификации
+├── pyproject.toml                   # Build config (hatchling)
+├── neuronium.toml                   # Конфигурация по умолчанию
+├── .env.example                     # Шаблон переменных окружения
+├── README.md                        # Быстрый старт
+└── CONTRIBUTING.md                  # Руководство контрибьютора
+```
+ 
+---
+ 
+## 4. Конфигурация
+ 
+### 4.1 Приоритет загрузки (CONFIG_SPEC §1)
+ 
+```
+CLI flags > Environment variables > TOML file > Built-in defaults
+```
+ 
+### 4.2 Загрузка конфигурации
+ 
+Файл: `neuronium_agent/config.py`
+ 
+```python
+def load_config(
+    config_path: str | None = None,
+    cli_overrides: dict[str, Any] | None = None,
+) -> AppConfig:
+```
+ 
+**Порядок:**
+1. Загружает `.env` файл (python-dotenv, override=False)
+2. Читает TOML (`neuronium.toml` или `config/neuronium.toml`)
+3. Применяет env-переменные `NEURONIUM_*`
+4. Применяет CLI overrides
+5. Валидирует через Pydantic → `AppConfig`
+ 
+### 4.3 Полная схема AppConfig
+ 
+```python
+class AppConfig(BaseModel):
+    project: ProjectConfig          # name, data_dir
+    determinism: DeterminismConfig  # canonical_json, seed, temperature, strict
+    runtime: RuntimeConfig          # mode, max_parallel, checkpoint_policy
+    storage: StorageConfig          # blob/index backends
+    queue: QueueConfig              # Redis+RQ
+    llm: LLMConfig                  # provider, model, api_key_env
+    model_catalog: ModelCatalogConfig | None  # Каталог моделей
+    mcp: McpConfig                  # MCP-серверы
+    code_node: CodeNodeConfig       # Docker sandbox
+    memory: MemoryConfig            # GraphRAG
+    logging: LoggingConfig          # level, json, path
+    recovery: RecoveryConfig        # retry policy
+```
+ 
+### 4.4 Детали каждой секции
+ 
+#### ProjectConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `name` | str | `"neuronium"` | Имя проекта |
+| `data_dir` | str | `".neuronium"` | Директория данных |
+ 
+#### DeterminismConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `canonical_json` | str | `"neuronium-v1"` | Формат канонического JSON |
+| `default_random_seed` | int | `0` | Seed для воспроизводимости |
+| `llm_temperature` | float | `0.0` | Температура LLM (0 = детерминизм) |
+| `strict` | bool | `False` | Отклонять non-deterministic узлы |
+| `mcp_allow_non_deterministic_tool_ids` | list[str] | `[]` | Allowlist для strict |
+ 
+#### RuntimeConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `mode` | Literal | `"batch"` | Режим: batch/supervised/interactive |
+| `max_parallel_nodes` | int | `4` | Макс. параллельных узлов |
+| `checkpoint_policy` | Literal | `"on_transition"` | Политика чекпоинтов |
+| `checkpoint_interval_seconds` | int\|None | `None` | Интервал (для periodic) |
+| `pause_grace_period_seconds` | int | `30` | Грейс-период для pause |
+| `stop_grace_period_seconds` | int | `5` | Грейс-период для stop |
+| `nl_patch_min_confidence` | float | `0.5` | Мин. уверенность NL→patch |
+ 
+#### StorageConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `blob_backend` | Literal | `"fs_cas"` | Бэкенд: fs_cas или s3 |
+| `fs_cas_root` | str | `".neuronium/blobs"` | Корень FS CAS |
+| `index_backend` | Literal | `"sqlite"` | Бэкенд: sqlite или postgres |
+| `sqlite_path` | str | `".neuronium/index.sqlite3"` | Путь SQLite |
+| `postgres_dsn` | str\|None | `None` | DSN для Postgres |
+| `postgres_schema` | str | `"neuronium_agent"` | Схема Postgres |
+| `migrations_auto_apply` | bool | `True` | Автоприменение миграций |
+ 
+#### QueueConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `enabled` | bool | `False` | Включить очередь |
+| `backend` | str | `"rq"` | Бэкенд очереди |
+| `redis_url` | str\|None | `None` | URL Redis |
+| `queue_name` | str | `"neuronium"` | Имя очереди |
+| `job_timeout_seconds` | int | `900` | Таймаут задачи |
+| `result_ttl_seconds` | int | `86400` | TTL результата |
+ 
+#### LLMConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `provider` | str | `"openai"` | Провайдер LLM |
+| `model` | str | `"gpt-4.1-mini"` | Модель по умолчанию |
+| `base_url` | str\|None | `None` | Custom base URL |
+| `api_key_env` | str | `"NEURONIUM_OPENAI_API_KEY"` | Env-переменная ключа |
+| `structured_output` | bool | `True` | Структурированный вывод |
+| `timeout_seconds` | int | `60` | Таймаут запроса |
+| `max_retries` | int | `2` | Макс. повторов |
+ 
+#### McpConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `enabled` | bool | `True` | Включить MCP |
+| `servers` | list[McpServerConfig] | `[]` | Список серверов |
+ 
+Каждый `McpServerConfig`:
+- `name`, `url`, `timeout_seconds`, `rate_limit_rps`
+- `policy`: `McpServerPolicy` (fs_roots_allowlist, network_allowlist, require_approval_for)
+ 
+#### CodeNodeConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `enabled` | bool | `True` | Включить CodeNode |
+| `runtime` | str | `"python"` | Рантайм |
+| `docker.enabled` | bool | `True` | Docker sandbox |
+| `docker.image` | str | `"python:3.11-slim"` | Docker образ |
+| `docker.network_enabled` | bool | `False` | Сеть в контейнере |
+| `docker.timeout_seconds` | int | `120` | Таймаут |
+ 
+#### RecoveryConfig
+| Поле | Тип | Default | Описание |
+|------|-----|---------|----------|
+| `max_node_retries` | int | `3` | Макс. повторов узла |
+| `max_stage_retries` | int | `2` | Макс. повторов стейджа |
+| `retry_backoff_base_seconds` | float | `1.0` | Базовый backoff |
+| `retry_count_upgrade_threshold` | int | `2` | Порог апгрейда до PERSISTENT |
+| `repeated_rollback_threshold` | int | `3` | Порог repeated rollback |
+| `allow_auto_replan` | bool | `False` | Авто-реплан |
+| `max_verdict_fix_attempts` | int | `1` | Макс. verdict fix |
+ 
+### 4.5 Переменные окружения
+ 
+Все переменные имеют префикс `NEURONIUM_`:
+ 
+```bash
+NEURONIUM_PROJECT_NAME=neuronium
+NEURONIUM_PROJECT_DATA_DIR=.neuronium
+NEURONIUM_STORAGE_BLOB_BACKEND=fs_cas
+NEURONIUM_STORAGE_INDEX_BACKEND=sqlite
+NEURONIUM_STORAGE_POSTGRES_DSN=postgresql+psycopg://...
+NEURONIUM_QUEUE_ENABLED=true
+NEURONIUM_QUEUE_REDIS_URL=redis://localhost:6379/0
+NEURONIUM_RUNTIME_MODE=batch
+NEURONIUM_LLM_PROVIDER=openai
+NEURONIUM_LLM_MODEL=gpt-4.1-mini
+NEURONIUM_LLM_BASE_URL=https://...
+NEURONIUM_LOGGING_LEVEL=INFO
+NEURONIUM_RECOVERY_MAX_NODE_RETRIES=3
+NEURONIUM_RECOVERY_MAX_STAGE_RETRIES=2
+NEURONIUM_MODEL_CATALOG_DEFAULT_MODEL_ID=default
+```
+ 
+### 4.6 Пример минимальной конфигурации (OSS)
+ 
+```toml
+[project]
+name = "neuronium"
+data_dir = ".neuronium"
+ 
+[determinism]
+canonical_json = "neuronium-v1"
+default_random_seed = 0
+llm_temperature = 0.0
+ 
+[runtime]
+mode = "batch"
+max_parallel_nodes = 4
+ 
+[storage]
+blob_backend = "fs_cas"
+index_backend = "sqlite"
+ 
+[llm]
+provider = "openai"
+model = "gpt-4.1-mini"
+```
+ 
+### 4.7 Пример production-конфигурации
+ 
+```toml
+[storage]
+index_backend = "postgres"
+postgres_dsn = "postgresql+psycopg://user:pass@localhost:5432/db"
+ 
+[queue]
+enabled = true
+redis_url = "redis://localhost:6379/0"
+ 
+[memory.semantic_search]
+enabled = true
+backend = "pgvector"
+```
+ 
+---
+ 
+## 5. Публичный API
+ 
+Файл: `neuronium_agent/api.py`
+ 
+### 5.1 AgentRunner — главный фасад
+ 
+```python
+class AgentRunner:
+    def __init__(
+        self,
+        config: AppConfig,
+        blob_store: BlobStore,
+        index_store: IndexStore,
+        *,
+        trace_event_listener: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None
+```
+ 
+**Методы:**
+ 
+| Метод | Сигнатура | Описание |
+|-------|-----------|----------|
+| `start` | `(request: RunRequest, *, on_handle_ready=None) → RunHandle` | Запуск агентного прогона |
+| `get_status` | `(handle: RunHandle) → RunStatus` | Текущий статус прогона |
+| `control` | `(handle: RunHandle, command: ControlCommand) → RunStatus` | Отправка управляющей команды |
+| `resume_run` | `(trace_id: str) → RunHandle` | Возобновление из checkpoint |
+| `export_trace` | `(handle, format, path) → None` | Экспорт trace в файл |
+| `replay` | `(trace_id: str) → RunHandle` | Replay из записанного trace |
+| `read_artifact_json` | `(artifact_id: str) → dict` | Загрузка артефакта как JSON |
+| `get_trace_events` | `(trace_id: str) → list[dict]` | Все trace-события |
+| `get_latest_pause_context` | `(trace_id: str) → dict\|None` | Контекст последней паузы |
+| `get_latest_rendered_artifact_path` | `(trace_id: str) → str\|None` | Путь к HTML-артефакту |
+ 
+### 5.2 Фабрика create_runner
+ 
+```python
+def create_runner(
+    config: AppConfig | None = None,
+    *,
+    trace_event_listener: Callable[[dict[str, Any]], None] | None = None,
+) -> AgentRunner:
+```
+ 
+Если `config=None`, загружает из цепочки по умолчанию. Создаёт blob_store и index_store на основе конфигурации.
+ 
+**Поддерживаемые бэкенды:**
+- Blob: `fs_cas` → `FsCasStore`
+- Index: `sqlite` → `SqliteIndexStore`, `postgres` → `PostgresIndexStore`
+ 
+### 5.3 Пример использования
+ 
+```python
+from neuronium_agent.api import create_runner
+from neuronium_agent.types import RunRequest, ControlCommand
+ 
+runner = create_runner()
+ 
+# Запуск
+handle = runner.start(RunRequest(objective="Write fibonacci"))
+ 
+# Статус
+status = runner.get_status(handle)
+ 
+# Управление
+runner.control(handle, ControlCommand(type="pause"))
+runner.control(handle, ControlCommand(type="continue"))
+ 
+# Экспорт trace
+runner.export_trace(handle, "jsonl", "trace.jsonl")
+ 
+# Replay
+new_handle = runner.replay(handle.trace_id)
+```
+ 
+---
+ 
+## 6. Типы данных и DTO
+ 
+Файл: `neuronium_agent/types.py`
+ 
+### 6.1 RunRequest — запрос на запуск
+ 
+```python
+class RunRequest(BaseModel):
+    objective: str                                              # Цель
+    constraints: list[str] = []                                 # Ограничения
+    mode: Literal["batch", "supervised", "interactive"] | None  # Режим
+    metadata: dict[str, Any] = {}                               # Метаданные
+```
+ 
+### 6.2 RunHandle — дескриптор запуска
+ 
+```python
+class RunHandle(BaseModel):
+    trace_id: str          # Уникальный ID трассировки
+    execution_id: str      # Уникальный ID исполнения
+    created_at: datetime   # Время создания
+```
+ 
+### 6.3 RunStatus — статус прогона
+ 
+```python
+class RunStatus(BaseModel):
+    state: Literal["PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED"]
+    progress: float | None = None          # 0.0..1.0
+    current_node_ref: str | None = None    # Текущий узел
+    message: str | None = None             # Сообщение
+```
+ 
+### 6.4 ControlCommand — управляющая команда
+ 
+```python
+class ControlCommand(BaseModel):
+    type: Literal["continue", "pause", "revise", "replan", "stop", "escalate"]
+    payload: dict[str, Any] = {}    # Для revise: patch или answers
+```
+ 
+### 6.5 InterruptRequest — внутренний контракт прерывания
+ 
+```python
+class InterruptRequest(BaseModel):
+    command: Literal["pause", "stop"]
+    mode: Literal["graceful", "immediate"] = "graceful"
+    export_path: str | None = None
+```
+ 
+### 6.6 NodeStatus
+ 
+```python
+class NodeStatus(BaseModel):
+    status: Literal[
+        "PENDING", "READY", "RUNNING", "COMPLETED",
+        "FAILED", "TIMEOUT", "RETRYING", "CANCELLED",
+    ] = "PENDING"
+```
+ 
+### 6.7 FailureClass
+ 
+```python
+class FailureClass(BaseModel):
+    kind: Literal["TRANSIENT", "PERSISTENT", "SYSTEMIC", "CRITICAL"]
+    message: str = ""
+    retryable: bool = False
+```
+ 
+### 6.8 TraceExportFormat
+ 
+```python
+TraceExportFormat = Literal["jsonl", "json", "zip"]
+```
+ 
+---
+ 
+## 7. Иерархия ошибок
+ 
+Файл: `neuronium_agent/errors.py`
+ 
+```
+NeuroniumError (Base)
+├── ConfigError          — Невалидная или отсутствующая конфигурация
+├── ValidationError      — Ошибка валидации данных (Pydantic / JSON-Schema)
+├── StorageError         — Ошибка blob/index store
+├── McpError             — Ошибка MCP-сервера / политики
+├── SandboxError         — Ошибка Docker-песочницы CodeNode
+└── ReplayError          — Несоответствие trace replay
+```
+ 
+### NeuroniumError — базовый класс
+ 
+```python
+class NeuroniumError(Exception):
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        node_ref: str | None = None,       # Ссылка на узел
+        trace_id: str | None = None,       # ID трассировки
+        classification: str | None = None,  # Классификация
+        details: dict[str, Any] | None = None,
+    ) -> None
+ 
+    def to_dict(self) -> dict[str, Any]:
+        # Сериализация для trace/audit
+        return {
+            "type": type(self).__name__,
+            "message": str(self),
+            "node_ref": self.node_ref,
+            "trace_id": self.trace_id,
+            "classification": self.classification,
+            "details": self.details,
+        }
+```
+ 
+---
+ 
+## 8. Когнитивное ядро (Cognitive Core)
+ 
+### 8.1 Цикл работы
+ 
+Система работает в 4-фазном цикле для каждой «Интенции» (objective):
+ 
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  COMMIT  │────▶│ EXECUTE  │────▶│ CONTROL  │────▶│  ADAPT   │
+│          │     │          │     │          │     │          │
+│ Создание │     │ Исполне- │     │ Примене- │     │ Оценка   │
+│ плана    │     │ ние DAG  │     │ ние      │     │ качества │
+│          │     │          │     │ команд   │     │ + recovery│
+└──────────┘     └──────────┘     └──────────┘     └──────────┘
+                                                        │
+                                                   ┌────┴────┐
+                                                   │         │
+                                                ┌──┴──┐  ┌──┴───┐
+                                                │DONE │  │FAILED│
+                                                └─────┘  └──────┘
+```
+ 
+### 8.2 Фазы
+ 
+- **COMMIT**: Создание плана (ActionGraph DAG), валидация
+- **EXECUTE**: Исполнение DAG в топологическом порядке
+- **CONTROL**: Обработка управляющих команд (pause/continue/revise/stop)
+- **ADAPT**: Оценка quality gate, решение о recovery
+- **DONE/FAILED**: Терминальные состояния
+ 
+### 8.3 Контрольные точки
+ 
+На каждой границе фаз записывается checkpoint в trace для поддержки pause/resume.
+ 
+---
+ 
+## 9. Состояние агента и жизненный цикл
+ 
+Файл: `neuronium_agent/core/state.py`
+ 
+### 9.1 IntentionPhase — фаза интенции
+ 
+```python
+class IntentionPhase(str, Enum):
+    COMMIT   = "COMMIT"
+    EXECUTE  = "EXECUTE"
+    CONTROL  = "CONTROL"
+    ADAPT    = "ADAPT"
+    DONE     = "DONE"
+    FAILED   = "FAILED"
+```
+ 
+### 9.2 RunState — состояние прогона
+ 
+```python
+class RunState(str, Enum):
+    PENDING   = "PENDING"
+    RUNNING   = "RUNNING"
+    PAUSED    = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED    = "FAILED"
+    CANCELLED = "CANCELLED"
+```
+ 
+### 9.3 Допустимые переходы состояний
+ 
+```
+PENDING   → { RUNNING, FAILED, CANCELLED }
+RUNNING   → { PAUSED, COMPLETED, FAILED, CANCELLED }
+PAUSED    → { RUNNING, CANCELLED }
+COMPLETED → ∅  (терминальное)
+FAILED    → ∅  (терминальное)
+CANCELLED → ∅  (терминальное)
+```
+ 
+### 9.4 Intention — интенция агента
+ 
+```python
+class Intention(BaseModel):
+    intention_id: str               # Уникальный ID
+    objective: str                  # Цель
+    constraints: list[str] = []     # Ограничения
+    plan_id: str | None = None      # ID плана
+    phase: IntentionPhase = COMMIT  # Текущая фаза
+```
+ 
+### 9.5 AgentState — полный снимок состояния
+ 
+```python
+class AgentState(BaseModel):
+    trace_id: str
+    execution_id: str
+    run_state: RunState = PENDING
+    intention: Intention | None = None
+    created_at: datetime
+    progress: float = 0.0
+    current_node_ref: str | None = None
+    message: str | None = None
+ 
+    def transition_to(self, new_state: RunState, message: str | None = None) -> None:
+        # Валидация перехода, обновление состояния
+```
+ 
+---
+ 
+## 10. Оркестратор
+ 
+Файл: `neuronium_agent/core/orchestrator.py`
+ 
+### 10.1 Класс Orchestrator
+ 
+```python
+class Orchestrator:
+    def __init__(
+        self,
+        config: AppConfig,
+        blob_store: BlobStore,
+        index_store: IndexStore,
+        *,
+        trace_event_listener: Callable | None = None,
+    ) -> None
+```
+ 
+**Внутреннее состояние:**
+- `_planner` — `HTNPlanner` для генерации DAG
+- `_states` — dict[trace_id → AgentState]
+- `_recorders` — dict[trace_id → TraceRecorder]
+- `_memory_store` — lazy init
+- `_operator_catalog` — `OperatorCatalog.default()`
+- `_interrupt_requests` — dict[trace_id → InterruptRequest | None]
+- `_MAX_ITERATIONS = 2` — макс. итераций autofix
+ 
+### 10.2 Поток start()
+ 
+1. Создаёт `AgentState` + `Intention`
+2. Персистирует run в index_store
+3. Создаёт `TraceRecorder`
+4. Записывает решение "Intention committed"
+5. Выбирает runbook (по умолчанию `autofix_demo`)
+6. Записывает решение "Runbook selected"
+7. Вызывает `_run_runbook()` синхронно
+8. Возвращает `RunHandle`
+ 
+### 10.3 Поток replay()
+ 
+1. Загружает original run из index_store
+2. Создаёт новый trace_id/execution_id
+3. Восстанавливает runbook_id из checkpoint
+4. Вызывает `_run_runbook()` с `ReplayProvider`
+ 
+### 10.4 Декларативные meta-control команды
+ 
+Метод `apply_control()`:
+- **pause**: устанавливает InterruptRequest, переводит в PAUSED
+- **continue**: переводит в RUNNING
+- **revise**: применяет patch/answers к состоянию (RFC6902)
+- **replan**: отмечает необходимость репланирования
+- **stop**: устанавливает InterruptRequest(command="stop")
+- **escalate**: записывает escalation
+ 
+Каждая команда:
+1. Мутирует состояние
+2. Записывает checkpoint
+3. Записывает trace decision
+ 
+### 10.5 Runbook-исполнение
+ 
+`_run_runbook()` — универсальный N-stage runner:
+ 
+1. Получает runbook через `get_runbook(runbook_id)`
+2. Строит stages через `runbook.build_stages()`
+3. Для каждого stage:
+   - **COMMIT**: строит граф (static, graph_builder, или dynamic planner)
+   - **EXECUTE**: создаёт node registry, запускает `DAGExecutor.execute()`
+   - **CONTROL**: проверяет interrupt
+   - **ADAPT**: оценивает success gate, решает recovery
+ 
+---
+ 
+## 11. Планирование
+ 
+### 11.1 HTN Planner
+ 
+Файл: `neuronium_agent/planning/htn.py`
+ 
+```python
+class HTNPlanner:
+    def plan(objective, constraints=None, *, plan_id=None) -> ActionGraph
+    def plan_iter1(objective, constraints=None, *, plan_id=None) -> ActionGraph
+    def plan_iter2_fix(objective, constraints=None, fix_context=None, *, plan_id=None) -> ActionGraph
+```
+ 
+#### Iteration 1: generate → execute → critic
+ 
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│ generate │────▶│ execute  │────▶│ critic   │
+│ (model)  │─────────────────────▶│ (model)  │
+└──────────┘     └──────────┘     └──────────┘
+```
+ 
+- `generate`: ModelNode с system_prompt для генерации Python-кода
+- `execute`: CodeNode — запуск сгенерированного кода
+- `critic`: ModelNode с структурированным выводом (DemoCriticVerdict)
+- critic получает входы от generate (код) И execute (результат)
+ 
+#### Iteration 2: fix → execute_fix → critic_fix
+ 
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│   fix    │────▶│exec_fix  │────▶│crit_fix  │
+│ (model)  │─────────────────────▶│ (model)  │
+└──────────┘     └──────────┘     └──────────┘
+```
+ 
+- `fix`: ModelNode с system_prompt для исправления кода
+- `execute_fix`: CodeNode — запуск исправленного кода
+- `critic_fix`: ModelNode — повторная проверка
+ 
+### 11.2 System Prompts
+ 
+- **Code Generation**: «You are a Python code generator. Output ONLY valid Python code.»
+- **Code Fix**: «You are a code-fixer. Make MINIMAL change. Output ONLY corrected code.»
+- **Inject Bug** (demo): Специальный prompt для демонстрации autofix
+- **Critic**: Строгая оценка exit_code/stdout/stderr → verdict PASS/FAIL/UNCERTAIN
+ 
+---
+ 
+## 12. Action Graph (DAG)
+ 
+Файл: `neuronium_agent/planning/dag.py`
+ 
+### 12.1 GraphNode — узел графа
+ 
+```python
+class GraphNode(BaseModel):
+    node_id: str                                                    # Уникальный ID
+    node_type: Literal["model", "mcp", "code", "decision", "aggregate"]
+    label: str = ""                                                 # Описание
+    parameters: dict[str, Any] = {}                                 # Параметры
+    priority: int = 0                                               # Приоритет (меньше = выше)
+```
+ 
+### 12.2 GraphEdge — ребро графа
+ 
+```python
+class GraphEdge(BaseModel):
+    source: str                                                     # node_id источника
+    target: str                                                     # node_id приёмника
+    edge_type: Literal["data", "control", "resource", "conditional"] = "data"
+    label: str = ""
+    condition: str | None = None
+```
+ 
+### 12.3 ConditionalBranch — условная ветвь
+ 
+```python
+class ConditionalBranch(BaseModel):
+    decision_node_id: str       # ID узла-решения
+    branch_label: str           # Метка ветви ("true" / "false")
+    target_node_ids: list[str]  # Узлы в этой ветви
+```
+ 
+### 12.4 ActionGraph — полный DAG
+ 
+```python
+class ActionGraph(BaseModel):
+    metadata: GraphMetadata                     # plan_id, created_at, description, version
+    nodes: list[GraphNode] = []
+    edges: list[GraphEdge] = []
+    conditional_branches: list[ConditionalBranch] = []
+```
+ 
+**Методы:**
+- `node_ids()` → list[str]
+- `node_map()` → dict[str, GraphNode]
+- `adjacency()` → dict[str, list[str]] — прямая смежность
+- `predecessors()` → dict[str, list[str]] — обратная смежность
+- `topological_order()` → list[str] — алгоритм Кана с детерминированным тай-брейкингом по (priority, node_id)
+ 
+### 12.5 Топологическая сортировка (алгоритм Кана)
+ 
+1. Вычислить in-degree для каждого узла
+2. Инициализировать очередь узлами с in-degree=0, отсортированными по (priority, node_id)
+3. Извлекать узел из очереди → добавлять в order
+4. Уменьшать in-degree преемников → добавлять в очередь при in-degree=0
+5. Сортировать очередь после каждого добавления
+6. Если len(order) ≠ len(nodes) → граф содержит цикл
+ 
+---
+ 
+## 13. Система узлов (Nodes)
+ 
+Файл: `neuronium_agent/nodes/`
+ 
+### 13.1 BaseNode — абстрактный базовый класс
+ 
+```python
+class BaseNode(ABC):
+    node_type: str = "base"
+ 
+    def __init__(self, node_id: str, parameters: dict | None = None) -> None
+ 
+    @abstractmethod
+    def execute(self, node_input: NodeInput) -> NodeOutput
+ 
+    def get_determinism_contract(self) -> DeterminismContract
+```
+ 
+### 13.2 NodeInput — унифицированный вход
+ 
+```python
+class NodeInput(BaseModel):
+    inputs: dict[str, Any] = {}       # Входные данные от предшественников
+    parameters: dict[str, Any] = {}   # Параметры узла из графа
+    context: NodeContext               # Контекст исполнения
+```
+ 
+### 13.3 NodeContext — контекст исполнения
+ 
+```python
+class NodeContext(BaseModel):
+    execution_id: str      # ID исполнения
+    trace_id: str          # ID трассировки
+    retry_count: int = 0   # Номер попытки
+    random_seed: int = 0   # Seed для детерминизма
+```
+ 
+### 13.4 NodeOutput — унифицированный выход
+ 
+```python
+class NodeOutput(BaseModel):
+    outputs: dict[str, Any] = {}                               # Выходные данные
+    quality_signals: QualitySignals = QualitySignals()          # Сигналы качества
+    status: Literal["COMPLETED", "FAILED", "TIMEOUT"] = "COMPLETED"
+    error: str | None = None                                    # Текст ошибки
+    failure_class: FailureClass | None = None                   # Классификация сбоя
+```
+ 
+### 13.5 QualitySignals
+ 
+```python
+class QualitySignals(BaseModel):
+    confidence: float | None = None    # Уверенность
+    tokens_used: int | None = None     # Использовано токенов
+    latency_ms: float | None = None    # Задержка
+    extras: dict[str, Any] = {}        # Доп. данные
+```
+ 
+### 13.6 ModelNode — LLM-вызов (OpenAI)
+ 
+```python
+class ModelNode(BaseNode):
+    node_type = "model"
+ 
+    def __init__(self, node_id, parameters=None, *,
+                 model="gpt-4.1-mini", provider="openai",
+                 api_key_env="NEURONIUM_OPENAI_API_KEY",
+                 base_url=None, structured_output=True,
+                 temperature=0.0, timeout=60, max_retries=2)
+```
+ 
+**Контракт детерминизма:** `uses_seed=True`, `declared_non_deterministic=False`
+ 
+**Поток execute():**
+1. Извлекает `prompt`, `system_prompt`, `json_schema` из inputs/parameters
+2. **Replay path**: если есть `_replay_responses` → возвращает записанный ответ
+3. **Live path**: вызывает OpenAI API
+   - Создаёт `openai.OpenAI(api_key, base_url, timeout, max_retries)`
+   - messages: [system, user]
+   - Передаёт `seed` из контекста
+   - Если structured_output + json_schema → `response_format: json_schema`
+   - Парсит parsed JSON если structured
+4. Записывает ответ для будущего replay
+ 
+**Выход:** `outputs = { "content": str, "parsed": dict | None }`
+ 
+### 13.7 CodeNode — Python в Docker
+ 
+```python
+class CodeNode(BaseNode):
+    node_type = "code"
+ 
+    def __init__(self, node_id, parameters=None, *,
+                 image="python:3.11-slim", network_enabled=False,
+                 cpu_limit=None, mem_limit=None, timeout_seconds=120)
+```
+ 
+**Контракт детерминизма:** `uses_seed=True`, `declared_non_deterministic=False`
+ 
+**Поток execute():**
+1. Извлекает `code` из inputs, снимает Markdown fences (```` ```python ... ``` ````)
+2. **Replay path**: если `_replay_responses` → записанный ответ
+3. **Docker path** (предпочтительный):
+   - `docker.from_env().containers.run(image, ["python", "-c", code], ...)`
+   - network_disabled, cpu_limit, mem_limit
+   - Захватывает stdout/stderr
+4. **Local fallback** (если Docker недоступен):
+   - `subprocess.run([sys.executable, "-c", code], capture_output=True)`
+   - Без песочницы — только для демо/dev
+ 
+**Выход:** `outputs = { "stdout": str, "stderr": str, "exit_code": int, "runner": "docker"|"local" }`
+ 
+### 13.8 McpToolNode — вызов инструментов
+ 
+```python
+class McpToolNode(BaseNode):
+    node_type = "mcp"
+ 
+    def __init__(self, node_id, parameters=None, *,
+                 server_name="", server_url="", timeout_seconds=60,
+                 policy=None, tool_runtime=None, deterministic=True)
+```
+ 
+**Контракт детерминизма:** `uses_seed=False`, `declared_non_deterministic` = not deterministic
+ 
+**Поток execute():**
+1. Извлекает `tool_name` из parameters (static) или inputs (dynamic)
+2. Строит `tool_args`: auto-wire upstream outputs → dynamic args → static args
+3. **Replay path**: записанный ответ
+4. **Policy gate**: проверка require_approval_for (v0.2: auto-approved)
+5. **Live path**: `invoke_local_tool(ToolCall(tool_name, tool_args), policy, runtime)`
+ 
+### 13.9 DecisionNode — условное ветвление
+ 
+```python
+class DecisionNode(BaseNode):
+    node_type = "decision"
+```
+ 
+**Поток execute():**
+1. Извлекает `condition` из parameters
+2. Безопасный eval: `bool(eval(condition, {"__builtins__": {}}, inputs))`
+3. Возвращает `branch_value = "true" | "false"`
+ 
+**Контракт B3:** `outputs["branch"]` должен совпадать с `ConditionalBranch.branch_label` в графе, чтобы executor мог исключить узлы в невыбранных ветвях.
+ 
+### 13.10 AggregateNode — слияние выходов
+ 
+```python
+class AggregateNode(BaseNode):
+    node_type = "aggregate"
+```
+ 
+Просто объединяет все входы (upstream outputs) в единый dict.
+ 
+### 13.11 DeterminismContract
+ 
+```python
+class DeterminismContract(BaseModel):
+    uses_seed: bool = False
+    declared_non_deterministic: bool = False
+```
+ 
+- `uses_seed=True` → узел использует `NodeContext.random_seed`
+- `declared_non_deterministic=True` → узел явно не-детерминистический
+- Если `config.determinism.strict=True` → такие узлы отклоняются при build registry
+ 
+---
+ 
+## 14. Исполнитель DAG (DAGExecutor)
+ 
+Файл: `neuronium_agent/execution/executor.py`
+ 
+### 14.1 Конструктор
+ 
+```python
+class DAGExecutor:
+    _MAX_RETRY_DELAY_SECONDS = 60.0
+ 
+    def __init__(
+        self,
+        node_registry: dict[str, BaseNode],
+        max_parallel: int = 4,
+        execution_id: str = "",
+        trace_id: str = "",
+        random_seed: int = 0,
+        trace_callback: Callable | None = None,
+        interrupt_check: Callable[[], InterruptRequest | None] | None = None,
+        max_node_retries: int = 3,
+        retry_backoff_base_seconds: float = 1.0,
+        retry_count_upgrade_threshold: int = 2,
+    )
+```
+ 
+### 14.2 Алгоритм execute()
+ 
+```python
+def execute(
+    self,
+    graph: ActionGraph,
+    *,
+    initial_inputs: dict[str, Any] | None = None,
+    initial_results: dict[str, NodeOutput] | None = None,
+) -> dict[str, NodeOutput] | ExecutionOutcome
+```
+ 
+**Поток:**
+ 
+1. **Подготовка**: вычисляет `topological_order()`, инициализирует `results = {}`
+2. **Resume**: если `initial_results` задан — предзаполняет results (для resume из checkpoint)
+3. **Группировка в batch'и**: узлы с одинаковым «уровнем» (нет зависимостей друг от друга) собираются в batch
+4. **Для каждого batch**:
+   a. Проверка `interrupt_check()` → если вернул InterruptRequest → выход с `ExecutionOutcome`
+   b. Проверка conditional branch pruning (B3)
+   c. Параллельное исполнение batch через `ThreadPoolExecutor(max_workers=max_parallel)`
+   d. Для каждого узла: `_execute_single()` с retry при неудаче
+5. **Возврат**: `results` (без interrupt_check) или `ExecutionOutcome` (с interrupt_check)
+ 
+### 14.3 Conditional Branch Pruning (B3)
+ 
+Когда `DecisionNode` завершается:
+1. Получает `branch_value` из output (например `"true"`)
+2. Находит все `ConditionalBranch` для этого decision_node
+3. Ветви с несовпадающим `branch_label` → все их `target_node_ids` помечаются «pruned»
+4. Pruned-узлы пропускаются при исполнении
+ 
+### 14.4 Retry-логика
+ 
+```python
+def _execute_single(self, node_id, graph, *, initial_inputs, retry_count=0) -> NodeOutput:
+```
+ 
+1. Собирает inputs от предшественников: `{source_id: results[source_id].outputs}`
+2. Добавляет `initial_inputs` (merge)
+3. Создаёт `NodeInput(inputs, parameters, NodeContext(execution_id, trace_id, retry_count, seed))`
+4. Emit `node_start` trace event
+5. Вызывает `node.execute(node_input)`
+6. При FAILED/TIMEOUT:
+   a. `classify_failure()` → FailureClass
+   b. Если retryable и retry_count < max → backoff + retry
+   c. Если retry_count ≥ upgrade_threshold → пересматривается на PERSISTENT
+7. Emit `node_end` trace event
+ 
+### 14.5 ExecutionOutcome
+ 
+```python
+class ExecutionOutcome:
+    results: dict[str, NodeOutput]      # Завершённые (м.б. частичные)
+    pending: list[str]                  # Неисполненные узлы
+    interrupted: InterruptRequest | None  # Причина прерывания
+```
+ 
+### 14.6 Preserve Initial Context
+ 
+Константа `_PRESERVE_INITIAL_CONTEXT_KEYS` — набор ключей artifact_id для clarification, которые сохраняются через batch'и и не перезатираются.
+ 
+---
+ 
+## 15. Runbook-система
+ 
+### 15.1 Runbook — абстрактный контракт
+ 
+Файл: `neuronium_agent/planning/runbook_contract.py`
+ 
+```python
+class Runbook(ABC):
+    @property
+    @abstractmethod
+    def runbook_id(self) -> str: ...
+ 
+    @property
+    def description(self) -> str | None: return None
+ 
+    @abstractmethod
+    def build_stages(
+        self, *, objective, constraints, metadata, execution_id
+    ) -> list[ActionGraphStage]: ...
+```
+ 
+### 15.2 ActionGraphStage — стейдж runbook'а
+ 
+```python
+class ActionGraphStage:
+    stage_id: str                                           # Уникальный ID
+    graph: ActionGraph | None = None                        # Статический граф
+    initial_inputs_override: dict[str, Any] | None = None   # Переопределение inputs
+    success_gate: StageSuccessGate | None = None            # Quality gate
+    dynamic_planner: DynamicPlannerSpec | None = None        # Динамический планировщик
+    graph_builder: GraphBuilder | None = None                # Лямбда для построения графа
+    exit_run_on_success: bool = False                        # Выход при успехе
+    proceed_to_next_stage_on_fail: bool = False              # Продолжить при провале
+    default_model_id: str | None = None                      # Модель по умолчанию
+```
+ 
+**Три способа построения графа:**
+1. `graph` — статический ActionGraph (готовый)
+2. `graph_builder` — вызывается с runtime-контекстом → возвращает ActionGraph
+3. `dynamic_planner` — LLM-based планирование через PlannerBackend
+ 
+### 15.3 StageSuccessGate — условие успеха
+ 
+```python
+class StageSuccessGate:
+    required_completed_nodes: list[str]     # Узлы, которые должны завершиться
+    critic_node_id: str | None = None       # Узел-критик (verdict проверяется)
+```
+ 
+### 15.4 Реестр runbook'ов
+ 
+Файл: `neuronium_agent/planning/runbook_registry.py`
+ 
+```python
+_REGISTRY: dict[str, Runbook] = {}
+ 
+def register_runbook(runbook: Runbook) -> None
+def get_runbook(runbook_id: str) -> Runbook | None
+def list_runbooks() -> list[str]
+```
+ 
+**Встроенные runbook'и** (lazy-load):
+ 
+| runbook_id | Класс | Описание |
+|------------|-------|----------|
+| `autofix_demo` | AutofixDemoRunbook | Autofix demo loop (iter1 + iter2_fix) |
+| `docs_report_v1` | DocsReportV1Runbook | Генерация отчёта по документам |
+| `dynamic_planner_demo_v1` | DynamicPlannerDemoV1Runbook | Динамический планировщик |
+| `htn_recursive_demo_v0` | HtnRecursiveDemoV0Runbook | HTN рекурсивный бэкенд |
+| `super_agent_v0` | SuperAgentV0Runbook | Суперагент с extraction + reporting |
+| `hybrid_memory_report_v1` | HybridMemoryReportV1Runbook | Гибридная память + отчёт |
+ 
+### 15.5 DocsReportV1Runbook — пример
+ 
+```python
+class DocsReportV1Runbook(Runbook):
+    runbook_id = "docs_report_v1"
+```
+ 
+Строит DAG:
+```
+read_doc_0 (mcp) ──┐
+read_doc_1 (mcp) ──┤──▶ merge (aggregate) ──▶ draft (model) ──▶ critic (model)
+read_doc_N (mcp) ──┘
+```
+ 
+- Один MCP-узел `fs.read_text` на каждый документ (детерминированный порядок)
+- `merge`: AggregateNode — собирает все тексты
+- `draft`: ModelNode — генерирует отчёт
+- `critic`: ModelNode — оценка качества
+ 
+---
+ 
+## 16. Динамический планировщик
+ 
+### 16.1 Контракт планировщика
+ 
+Файл: `neuronium_agent/planning/planner_contract.py`
+ 
+#### DynamicPlannerSpec — спецификация
+ 
+```python
+class DynamicPlannerSpec:
+    planner_node_id: str               # ID узла-планировщика
+    planner_system_prompt: str         # System prompt для LLM
+    allowed_node_types: list[str]      # Допустимые типы узлов
+    allowed_tool_names: list[str]      # Допустимые инструменты
+    backend_options: dict              # Опции бэкенда
+    backend_name: str                  # Имя бэкенда
+    backend_version: str               # Версия
+```
+ 
+#### PlannerRequest — запрос к планировщику
+ 
+```python
+class PlannerRequest:
+    objective: str
+    constraints: list[str]
+    metadata: dict
+    runbook_id: str
+    stage_id: str
+    execution_id: str
+    spec: DynamicPlannerSpec
+    operator_catalog_hash: str         # Хеш каталога для детерминизма
+    allowed_capabilities: list[str]
+```
+ 
+#### PlannerResult — успешный результат
+ 
+```python
+class PlannerResult:
+    action_graph: ActionGraph          # Построенный DAG
+    backend_name: str
+    backend_version: str
+    operator_catalog_hash: str
+    decision_trace: PlannerDecisionTrace  # Формальная запись решений
+```
+ 
+#### PlannerEscalation — эскалация (нужна помощь)
+ 
+```python
+class PlannerEscalation:
+    reason: str                                    # Причина
+    clarification_request_artifact_id: str | None  # Артефакт с вопросами
+    missing_fields: list[str]                      # Пропущенные поля
+    evidence_artifact_ids: list[str]               # Артефакты-доказательства
+    decision_trace: PlannerDecisionTrace | None
+```
+ 
+#### PlannerOutcome
+ 
+```python
+PlannerOutcome = PlannerResult | PlannerEscalation
+```
+ 
+### 16.2 PlannerDecisionTrace — запись решений
+ 
+```python
+class PlannerDecisionTrace:
+    subgoals: list[str]                # Подцели
+    selected_methods: list[str]        # Выбранные методы
+    justification_keys: list[str]      # Ключи обоснований
+    decomposition_steps: list[str]     # Шаги декомпозиции
+    method_expansion_path: list[str]   # Путь расширения методов
+    leaf_operators: list[str]          # Конечные операторы
+    notes: str                         # Заметки
+```
+ 
+---
+ 
+## 17. Верификация и критики
+ 
+### 17.1 SimulatedCritic (stub v1)
+ 
+Файл: `neuronium_agent/verification/critic.py`
+ 
+```python
+class Evidence:
+    source: str
+    description: str
+    confidence: float
+ 
+class CriticVerdict:
+    verdict: Literal["PASS", "CONDITIONAL_PASS", "FAIL", "UNCERTAIN"]
+    confidence: float
+    reasoning: str
+    evidence: list[Evidence]
+    gaps: list[str]
+ 
+class CriticInput:
+    node_id: str
+    node_type: str
+    outputs: dict
+    quality_signals: QualitySignals
+    criteria: dict
+ 
+class SimulatedCritic:
+    def evaluate(self, critic_input: CriticInput) -> CriticVerdict:
+        # v1 stub: всегда PASS
+```
+ 
+### 17.2 DemoCriticVerdict — LLM-критик
+ 
+Файл: `neuronium_agent/verification/demo_critic.py`
+ 
+```python
+class DemoCriticVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # Для OpenAI strict mode
+ 
+    verdict: Literal["PASS", "FAIL", "UNCERTAIN"]
+    confidence: float
+    evidence: list[str]
+    gaps: list[str]
+    suggestions: list[str]
+```
+ 
+**Жёсткое правило:** PASS требует непустой `evidence`. Если `evidence` пустой при PASS → downgrade до UNCERTAIN.
+ 
+#### critic_json_schema()
+ 
+Возвращает JSON Schema для OpenAI structured output. Патчит `suggestions.items` для strict mode compliance.
+ 
+#### parse_critic_verdict()
+ 
+```python
+def parse_critic_verdict(raw_content: str) -> DemoCriticVerdict
+```
+ 
+1. Парсит JSON из `raw_content`
+2. Применяет жёсткое правило (PASS + пустой evidence → UNCERTAIN)
+3. При ошибке парсинга → UNCERTAIN с gaps
+ 
+### 17.3 CRITIC_SYSTEM_PROMPT
+ 
+```
+You are a strict code-execution critic for an automated agent.
+Evaluate the provided code + execution output against the objective.
+...
+Return PASS only when exit_code == 0 AND stdout demonstrates
+the objective is met. Otherwise FAIL with gaps and suggestions.
+```
+ 
+---
+ 
+## 18. Хранилище (Storage)
+ 
+### 18.1 BlobStore — абстрактное хранилище бинарных данных
+ 
+Файл: `neuronium_agent/storage/blob_store.py`
+ 
+```python
+class BlobStore(ABC):
+    @abstractmethod
+    def put(self, artifact_id: str, blob_bytes: bytes, media_type: str) -> None
+    @abstractmethod
+    def get(self, artifact_id: str) -> bytes
+    @abstractmethod
+    def exists(self, artifact_id: str) -> bool
+```
+ 
+- Идемпотентный `put()` (повторная запись того же artifact_id — no-op)
+- `get()` выбрасывает `StorageError` если артефакт не найден
+ 
+### 18.2 FsCasStore — файловая CAS-реализация
+ 
+Файл: `neuronium_agent/storage/fs_cas.py`
+ 
+**Структура на диске:**
+```
+.neuronium/blobs/
+├── sha256/
+│   ├── ab/
+│   │   └── cd/
+│   │       ├── sha256:abcdef...1234.blob
+│   │       └── sha256:abcdef...1234.meta.json
+│   └── ...
+```
+ 
+- Шардирование: первые 2 + следующие 2 символа хеша
+- `meta.json` содержит: artifact_id, media_type, created_at
+- Потокобезопасный (os.replace для атомарной записи)
+ 
+### 18.3 IndexStore — абстрактное хранилище метаданных
+ 
+Файл: `neuronium_agent/storage/index_store.py`
+ 
+```python
+class IndexStore(ABC):
+    # Runs
+    def upsert_run(self, trace_id, execution_id, objective, state, metadata_json) -> None
+    def get_run(self, trace_id) -> dict | None
+    def update_run_state(self, trace_id, state) -> None
+ 
+    # Artifacts
+    def record_artifact_metadata(self, artifact_id, media_type, producer_node_ref, ...) -> None
+    def get_artifact(self, artifact_id) -> dict | None
+    def mark_artifacts_deprecated(self, artifact_ids, deprecated_at) -> None
+ 
+    # Lineage
+    def record_lineage_edge(self, parent_artifact_id, child_artifact_id, ...) -> None
+ 
+    # Trace events
+    def append_trace_event(self, trace_id, event_json) -> None
+    def get_trace_events(self, trace_id) -> list[dict]
+ 
+    # Node executions
+    def upsert_node_execution(self, execution_id, node_id, node_ref, status, ...) -> None
+ 
+    # Lifecycle
+    def close(self) -> None
+```
+ 
+### 18.4 SqliteIndexStore
+ 
+Файл: `neuronium_agent/storage/sqlite_store.py`
+ 
+- WAL mode для concurrent reads
+- `PRAGMA foreign_keys = ON`
+- Автоматические миграции при `auto_migrate=True`
+- `threading.Lock` для сериализации записи
+ 
+**Таблицы:**
+- `runs` — trace_id (PK), execution_id, objective, state, metadata_json, created_at, updated_at
+- `artifacts` — artifact_id (PK), media_type, producer_node_ref, trace_id, deprecated_at, ...
+- `lineage_edges` — parent_artifact_id, child_artifact_id, edge_type, ...
+- `trace_events` — id (autoincrement), trace_id, event_json, created_at
+- `node_executions` — execution_id + node_id (composite PK), node_ref, status, ...
+ 
+### 18.5 PostgresIndexStore
+ 
+Файл: `neuronium_agent/storage/postgres_store.py`
+ 
+- Идентичный интерфейс IndexStore
+- Использует `psycopg` (PostgreSQL 3+ driver)
+- Схема: `neuronium_agent` (настраивается)
+- Connection pooling через psycopg pool
+ 
+### 18.6 Миграции
+ 
+Файл: `neuronium_agent/storage/migrator.py`
+ 
+- SQL-файлы в `neuronium_agent/storage/migrations/sqlite/` и `/postgres/`
+- Таблица `schema_migrations` для отслеживания
+- `apply_migrations(conn, backend)` — применяет pending миграции
+ 
+---
+ 
+## 19. Трассировка и аудит
+ 
+### 19.1 TraceRecorder — append-only регистратор
+ 
+Файл: `neuronium_agent/trace/recorder.py`
+ 
+```python
+class TraceRecorder:
+    def __init__(
+        self,
+        trace_id: str,
+        index_store: IndexStore,
+        *,
+        event_listener: Callable[[dict], None] | None = None,
+    )
+```
+ 
+**Внутреннее состояние:**
+- `_events` — in-memory list (для быстрого доступа)
+- `_lock` — `threading.Lock` (thread safety)
+- `_listener` — optional callback при каждом событии
+ 
+#### record() — базовый метод
+ 
+```python
+def record(self, kind: str, payload: dict, *, span_id=None, parent_span_id=None) -> dict
+```
+ 
+Создаёт event:
+```json
+{
+    "trace_id": "...",
+    "ts": "2026-03-22T12:00:00Z",
+    "span_id": "uuid4 или переданный",
+    "parent_span_id": null,
+    "kind": "decision",
+    "payload": { ... }
+}
+```
+ 
+Сохраняет в `index_store.append_trace_event()` и вызывает `_listener(event)`.
+ 
+#### Специализированные методы
+ 
+| Метод | kind | Данные |
+|-------|------|--------|
+| `record_node_start(node_id, node_ref, node_type, inputs)` | `"node_start"` | node_id, node_ref, node_type, inputs_summary |
+| `record_node_end(node_id, node_ref, status, outputs, error, span_id)` | `"node_end"` | status, outputs, error, replay_data |
+| `record_decision(description, details, record, decision_type)` | `"decision"` | Формальный DecisionRecord |
+| `record_checkpoint(state_snapshot)` | `"checkpoint"` | Полный снимок состояния |
+| `record_determinism_audit(nodes_using_seed, seed_value)` | `"determinism_audit"` | Аудит seed'ов |
+ 
+### 19.2 Формальные записи решений (DecisionRecord)
+ 
+Файл: `neuronium_agent/trace/decision_record.py`
+ 
+```python
+class DecisionType(str, Enum):
+    PLANNING    = "PLANNING"
+    EXECUTION   = "EXECUTION"
+    CONTROL     = "CONTROL"
+    ADAPTATION  = "ADAPTATION"
+    ESCALATION  = "ESCALATION"
+    META_CONTROL = "META_CONTROL"
+ 
+class DecisionAuthority(str, Enum):
+    COMPONENT = "COMPONENT"
+    USER      = "USER"
+    HYBRID    = "HYBRID"
+```
+ 
+#### DecisionRecord
+ 
+```python
+class DecisionRecord:
+    id: str                                     # Уникальный ID
+    timestamp: str                              # ISO 8601
+    trace_id: str
+    intention_id: str
+    decision_type: DecisionType
+    context: DecisionContext                     # Снимок состояния + цели + ограничения
+    options_considered: list[OptionConsidered]   # Рассмотренные варианты
+    selected_option: SelectedOption             # Выбранный вариант
+    outcome_correlation: OutcomeCorrelation | None  # Пост-hoc корреляция
+```
+ 
+#### OptionConsidered
+ 
+```python
+class OptionConsidered:
+    option_id: str
+    description: str
+    predicted_outcome: str
+    score: float
+    confidence: float
+```
+ 
+#### SelectedOption
+ 
+```python
+class SelectedOption:
+    option_id: str
+    selection_rationale: str
+    decision_authority: DecisionAuthority
+    expected_outcome: str
+```
+ 
+### 19.3 TraceExporter
+ 
+Файл: `neuronium_agent/trace/exporter.py`
+ 
+Экспортирует trace в три формата:
+- **jsonl** — одно событие на строку
+- **json** — массив событий
+- **zip** — JSON + метаданные в ZIP-архиве
+ 
+---
+ 
+## 20. Контрольные точки и возобновление
+ 
+Файл: `neuronium_agent/trace/checkpoints.py`
+ 
+### 20.1 Phase Boundaries — допустимые метки
+ 
+```python
+PHASE_BOUNDARIES = {
+    "after_commit_iter1",
+    "after_execute_iter1",
+    "after_control_iter1",
+    "after_adapt_iter1",
+    "after_commit_iter2",
+    "after_execute_iter2",
+    "after_control_iter2",
+    "final",
+    "paused",
+    "paused_mid_execute",
+    "cancelled_mid_execute",
+}
+```
+ 
+### 20.2 Mid-Execute Checkpoint
+ 
+Для pause mid-execute checkpoint **обязательно** содержит:
+ 
+```python
+MID_EXECUTE_REQUIRED_KEYS = {
+    "stage_index",
+    "iteration",
+    "plan_id",
+    "runbook_id",
+    "completed_node_results",
+    "pending_node_ids",
+}
+```
+ 
+**Опциональные ключи:**
+```python
+MID_EXECUTE_OPTIONAL_KEYS = {
+    "metadata", "gate_snapshot", "planned_graph",
+    "stage_id", "stage_retry_count",
+}
+```
+ 
+### 20.3 Функции
+ 
+#### get_latest_phase_boundary_checkpoint()
+ 
+```python
+def get_latest_phase_boundary_checkpoint(
+    index_store: IndexStore, trace_id: str
+) -> dict | None
+```
+ 
+Ищет последний checkpoint event с валидной phase_boundary меткой.
+ 
+#### load_state_from_checkpoint()
+ 
+```python
+def load_state_from_checkpoint(
+    checkpoint_payload: dict,
+) -> tuple[AgentState, dict[str, Any]]
+```
+ 
+Восстанавливает `AgentState` и `resume_context` (stage_index, iteration, plan_id, runbook_id, completed_node_results, pending_node_ids и т.д.)
+ 
+#### build_checkpoint_payload()
+ 
+```python
+def build_checkpoint_payload(
+    agent_state: AgentState,
+    resume_context: dict[str, Any],
+) -> dict
+```
+ 
+Строит payload для записи checkpoint'а.
+ 
+### 20.4 Поток Pause → Resume
+ 
+```
+1. Пользователь: ControlCommand(type="pause")
+2. Orchestrator.apply_control():
+   - Устанавливает InterruptRequest(command="pause")
+   - Переводит состояние в PAUSED
+3. DAGExecutor: на следующей проверке interrupt_check():
+   - Возвращает ExecutionOutcome с completed + pending
+4. Orchestrator: записывает checkpoint "paused_mid_execute"
+5. (Позже) runner.resume_run(trace_id):
+   - Загружает checkpoint
+   - Восстанавливает AgentState + resume_context
+   - Перезапускает _run_runbook() с initial_results (завершённые узлы)
+```
+ 
+---
+ 
+## 21. Воспроизведение (Replay)
+ 
+Файл: `neuronium_agent/trace/replay.py`
+ 
+### 21.1 ReplayProvider
+ 
+```python
+class ReplayProvider:
+    def __init__(self, events: Iterable[dict])
+```
+ 
+**Инициализация:**
+1. Парсит все events
+2. Из `kind="node_end"` + `payload.replay_data` → основная карта ответов
+3. Fallback: из `kind="node_end"` + `payload.outputs` → вторичная карта
+4. Из `kind="planner"` → `planner_catalog_hashes`
+ 
+### 21.2 inject() — инъекция записанных ответов
+ 
+```python
+def inject(
+    self,
+    node_registry: dict[str, BaseNode],
+    *,
+    strict: bool = True,
+) -> dict[str, list[str]]
+```
+ 
+Для каждого узла в registry:
+1. Если есть replay_data → `node.set_replay_responses(responses)`
+2. Если нет replay_data, но есть fallback → использует fallback
+3. **Strict mode:** если нет данных для узла → `ReplayError`
+ 
+**Возврат:**
+```python
+{
+    "injected": ["generate", "execute", "critic"],
+    "injected_fallback": [],
+    "missing": [],
+}
+```
+ 
+### 21.3 Полный поток Replay
+ 
+```
+1. runner.replay(trace_id)
+2. → Orchestrator.replay(trace_id, replay_provider)
+3.   → Загружает original events
+4.   → Создаёт ReplayProvider(events)
+5.   → _run_runbook():
+6.     → _build_node_registry():
+7.       → replay_provider.inject(registry, strict=True)
+8.       → Каждый узел получает pre-recorded ответы
+9.     → DAGExecutor.execute():
+10.      → Каждый node.execute() возвращает записанный ответ
+11.    → Детерминистический результат
+```
+ 
+### 21.4 Записанные данные (replay_data)
+ 
+Для каждого узла при записи сохраняется:
+- **ModelNode**: полный ответ LLM (content, parsed, usage)
+- **CodeNode**: stdout, stderr, exit_code
+- **McpToolNode**: полный ответ инструмента
+ 
+---
+ 
+## 22. Восстановление после сбоев (Recovery)
+ 
+### 22.1 Классификация сбоев
+ 
+Файл: `neuronium_agent/recovery/classifier.py`
+ 
+```python
+def classify_failure(
+    node_id: str,
+    node_type: str,
+    status: str,
+    error: str,
+    retry_count: int,
+    *,
+    retry_count_upgrade_threshold: int = 2,
+) -> FailureClass
+```
+ 
+**Эвристики классификации:**
+ 
+| Класс | Паттерны в error | retryable |
+|-------|------------------|-----------|
+| **CRITICAL** | "permission denied", "OOM", "killed", "out of memory" | False |
+| **TRANSIENT** | "timeout", "rate limit", "429", "502", "503", "504" | True |
+| **PERSISTENT** | "invalid", "auth", "401", "403", "not found", "404" | False |
+| **SYSTEMIC** | "constraint", "deadlock" | False |
+| **PERSISTENT** (default) | Всё остальное | False |
+ 
+**Upgrade mechanism:** Если `retry_count >= retry_count_upgrade_threshold` и FailureClass = TRANSIENT → пересматривается на PERSISTENT (retryable=False).
+ 
+### 22.2 Rollback Scope
+ 
+Файл: `neuronium_agent/recovery/scope.py`
+ 
+```python
+class RollbackScopeType(str, Enum):
+    NODE             = "NODE"              # Один узел + dependents
+    SUBGRAPH         = "SUBGRAPH"          # Подграф (critic rejection)
+    CONSTRAINT_SCOPE = "CONSTRAINT_SCOPE"  # Нарушение ограничений
+    INTENTION        = "INTENTION"         # Весь граф
+ 
+class RollbackScope:
+    scope_type: RollbackScopeType
+    node_ids: set[str]                     # Узлы для rollback
+    preservation_node_ids: set[str]        # Узлы для сохранения
+    preservation_artifact_ids: list[str]   # Артефакты для сохранения
+```
+ 
+#### compute_rollback_scope()
+ 
+```python
+def compute_rollback_scope(
+    failure_type: str,
+    graph: ActionGraph,
+    failed_node_ids: set[str],
+    *,
+    critic_failed: bool = False,
+    completed_node_ids: set[str] | None = None,
+    gate_required_node_ids: list[str] | None = None,
+) -> RollbackScope
+```
+ 
+**Правила:**
+- `NODE` scope: failed + все transitive dependents
+- `SUBGRAPH` scope: если critic_failed, расширяет до всех gate_required узлов
+- `CONSTRAINT_SCOPE`: все узлы кроме preservation
+- `INTENTION`: весь граф (крайний случай)
+ 
+### 22.3 Recovery Policy
+ 
+Файл: `neuronium_agent/recovery/policy.py`
+ 
+```python
+def decide_recovery(
+    failed_nodes: dict[str, FailureClass],
+    gate_failed: bool,
+    stage_retry_count: int,
+    config: RecoveryConfig,
+    *,
+    critic_failed: bool = False,
+    failure_history: list[dict] | None = None,
+    rollback_scope: RollbackScope | None = None,
+    has_dynamic_planner: bool = False,
+) -> RecoveryDecision
+```
+ 
+#### RecoveryDecision
+ 
+```python
+class RecoveryDecision:
+    action: RecoveryAction  # RETRY_STAGE | ESCALATE | FAIL | REPLAN
+    reason: str
+    escalation_context: dict
+    rollback_scope: RollbackScope | None
+```
+ 
+#### Дерево решений
+ 
+```
+1. Есть CRITICAL сбой?
+   → FAIL (немедленно)
+ 
+2. Repeated rollback (один узел >= threshold)?
+   → ESCALATE (или REPLAN если has_dynamic_planner + allow_auto_replan)
+ 
+3. Все TRANSIENT + stage_retry_count < max_stage_retries?
+   → RETRY_STAGE
+ 
+4. PERSISTENT или retries исчерпаны?
+   → ESCALATE (или REPLAN если SYSTEMIC + allow_auto_replan)
+ 
+5. Иначе:
+   → FAIL
+```
+ 
+---
+ 
+## 23. Протокол управления (Control Protocol)
+ 
+Файл: `neuronium_agent/control/protocol.py`
+ 
+### 23.1 ControlProtocol
+ 
+```python
+class ControlProtocol:
+    def classify_command(self, command: ControlCommand) -> dict[str, Any]
+    def classify_feedback_text(self, feedback_text: str) -> dict[str, Any]
+    def needs_clarification(self, command: ControlCommand) -> bool
+```
+ 
+#### classify_command()
+ 
+Возвращает:
+```python
+{
+    "action": "continue" | "pause" | "revise" | "replan" | "stop" | "escalate",
+    "confidence": 1.0,
+    "payload": { ... }
+}
+```
+ 
+#### classify_feedback_text()
+ 
+Классифицирует естественный язык в управляющую команду:
+```python
+{
+    "action": "continue" | "revise" | "escalate",
+    "confidence": 0.0..1.0,
+    "payload": { "feedback": "..." }
+}
+```
+ 
+#### needs_clarification()
+ 
+v1: всегда `False`. В будущем — NL-анализ для определения необходимости уточнений.
+ 
+---
+ 
+## 24. Память (GraphRAG-lite)
+ 
+### 24.1 Модели данных
+ 
+Файл: `neuronium_agent/memory/models.py`
+ 
+#### ChunkLocator
+ 
+```python
+class ChunkLocator:
+    source_uri: str
+    start_char: int | None
+    end_char: int | None
+    start_line: int | None
+    end_line: int | None
+```
+ 
+#### EvidenceRef
+ 
+```python
+class EvidenceRef:
+    chunk_id: str
+    source_artifact_id: str
+    source_kind: Literal["internal_docs", "user_docs", "tool_output"]
+    visibility: Literal["user", "internal", "audit_only"]
+    locator: ChunkLocator | None
+    quote: str | None
+    quote_hash: str | None
+    relevance_score: float | None
+    confidence: float | None
+```
+ 
+#### MemoryQuery
+ 
+```python
+class MemoryQuery:
+    query: str
+    mode: Literal["structured", "hybrid", "semantic", "iterative"] = "structured"
+    top_k: int = 10
+    constraints: MemoryQueryConstraints | None = None
+    require_exact_mode: bool = False
+```
+ 
+#### MemoryQueryConstraints
+ 
+```python
+class MemoryQueryConstraints:
+    entity_types: list[str] | None = None
+    relation_types: list[str] | None = None
+    source_filter: list[str] | None = None
+    source_kind_filter: list[str] | None = None
+    visibility_filter: list[str] | None = None
+    confidence_threshold: float | None = None
+```
+ 
+#### MemoryResult
+ 
+```python
+class MemoryResult:
+    effective_mode: str
+    warnings: list[str]
+    retrieved_chunks: list[RetrievedChunk]
+    evidence_refs: list[EvidenceRef]
+    stats: MemoryQueryStats
+```
+ 
+#### MemoryIngestRequest / MemoryIngestResult
+ 
+```python
+class MemoryIngestRequest:
+    paths: list[str]
+    source_kind: str = "internal_docs"
+    visibility: str = "internal"
+    chunk_max_chars: int = 2000
+    chunk_overlap_chars: int = 200
+ 
+class MemoryIngestResult:
+    ingested_count: int
+    chunk_ids: list[str]
+    source_artifact_ids: list[str]
+    warnings: list[str]
+```
+ 
+### 24.2 MemoryStore — абстрактный интерфейс
+ 
+Файл: `neuronium_agent/memory/store.py`
+ 
+```python
+class MemoryStore(ABC):
+    def upsert_chunk(self, chunk_id, source_artifact_id, text, metadata_json, created_at)
+    def get_chunk(self, chunk_id) -> dict | None
+    def list_chunks(self, *, source_artifact_id=None, metadata_filters=None, order_by, limit)
+    def search_keyword_topk(self, query, *, top_k, metadata_filters) -> list[dict]
+    def count_chunks(self, *, metadata_filters=None) -> int
+    def close()
+```
+ 
+### 24.3 Режимы поиска
+ 
+- **structured** — keyword-based поиск по чанкам
+- **semantic** — векторный поиск (pgvector или local embeddings)
+- **hybrid** — комбинация keyword + semantic
+- **iterative** — multi-hop retrieval с цепочкой запросов
+ 
+---
+ 
+## 25. Инструменты (Tools)
+ 
+### 25.1 Диспетчер invoke_local_tool()
+ 
+Файл: `neuronium_agent/tools/local_tools.py`
+ 
+```python
+def invoke_local_tool(
+    call: ToolCall,
+    *,
+    policy: McpServerPolicy | None = None,
+    runtime: ToolRuntime | None = None,
+) -> dict[str, Any]
+```
+ 
+**Маршрутизация по префиксу tool_name:**
+ 
+| Префикс | Функция | Описание |
+|----------|---------|----------|
+| `memory.*` | memory_tools | Ingestion и query памяти |
+| `web.*` | web_tools | HTTP fetch и extraction |
+| `text.*` | text_tools | Извлечение сущностей |
+| `artifact.*` | artifact_tools | Запись артефактов |
+| `export.*` | export_tools | Экспорт текста |
+| `fs.read_text` | встроенный | Чтение файла с allowlist |
+ 
+### 25.2 ToolCall
+ 
+```python
+class ToolCall:
+    tool_name: str
+    tool_args: dict[str, Any]
+```
+ 
+### 25.3 Безопасность
+ 
+- `fs.read_text` проверяет путь через `_ensure_allowed_path()`:
+  - Путь нормализуется (resolve, expanduser)
+  - Проверяется что путь находится внутри `fs_roots_allowlist`
+  - Guard от size overflow (макс. размер файла)
+- `ToolPolicyError` при нарушении политики
+- `ToolExecutionError` при ошибке выполнения
+ 
+### 25.4 Инструменты памяти
+ 
+Файл: `neuronium_agent/tools/memory_tools.py`
+ 
+- `memory.ingest_files` — принимает `MemoryIngestRequest`, чанкирует файлы, сохраняет в MemoryStore
+- `memory.query` — принимает `MemoryQuery`, выполняет поиск, возвращает `MemoryResult`
+ 
+### 25.5 Web-инструменты
+ 
+Файл: `neuronium_agent/tools/web_tools.py`
+ 
+- `web.fetch_html` — загрузка HTML-страницы
+- `web.extract_article` — извлечение основного контента статьи
+ 
+### 25.6 Текстовые инструменты
+ 
+Файл: `neuronium_agent/tools/text_tools.py`
+ 
+- `text.extract_entities` — NER-извлечение сущностей из текста
+ 
+### 25.7 Инструменты артефактов
+ 
+Файл: `neuronium_agent/tools/artifact_tools.py`
+ 
+- `artifact.put_json` — сериализация и запись JSON-артефакта в BlobStore
+ 
+### 25.8 Экспорт-инструменты
+ 
+Файл: `neuronium_agent/tools/export_tools.py`
+ 
+- `export.write_text` — запись текстового файла на диск
+ 
+---
+ 
+## 26. Каноническая JSON-сериализация
+ 
+Файл: `neuronium_agent/_canonical.py`
+ 
+### 26.1 Правила канонического JSON (neuronium-v1)
+ 
+1. **Сортировка ключей**: `sort_keys=True`
+2. **Компактные разделители**: `(",", ":")`
+3. **UTF-8**: `ensure_ascii=False`
+4. **Без NaN/Infinity**: валидация перед сериализацией
+5. **datetime → ISO 8601**: `.isoformat()`
+6. **date → ISO 8601**: `.isoformat()`
+7. **bytes → hex**: `.hex()`
+8. **Pydantic v2**: `model_dump(mode="json")`
+ 
+### 26.2 Функции
+ 
+```python
+def canonical_json(obj: Any) -> str
+    # Детерминистическая JSON-строка
+ 
+def canonical_bytes(obj: Any) -> bytes
+    # canonical_json().encode("utf-8")
+ 
+def content_hash(data: bytes) -> str
+    # hashlib.sha256(data).hexdigest()
+ 
+def artifact_id(content_bytes: bytes, creation_context: dict) -> str
+    # f"sha256:{content_hash(content_bytes)}"
+```
+ 
+### 26.3 Контракт
+ 
+- `canonical_json(X) == canonical_json(X)` для любого допустимого X
+- Два одинаковых объекта всегда дают одинаковый JSON
+- `artifact_id` зависит только от `content_bytes` (creation_context игнорируется в v1)
+ 
+---
+ 
+## 27. Детерминизм и контракты
+ 
+### 27.1 Контракт детерминизма узла
+ 
+```python
+class DeterminismContract:
+    uses_seed: bool = False                    # Использует random_seed
+    declared_non_deterministic: bool = False   # Явно не-детерминистический
+```
+ 
+### 27.2 Матрица типов узлов
+ 
+| Тип | uses_seed | non_deterministic | Примечание |
+|-----|-----------|-------------------|------------|
+| ModelNode | True | False | seed передаётся в OpenAI API |
+| CodeNode | True | False | seed через PYTHONHASHSEED |
+| McpToolNode | False | configurable | Зависит от инструмента |
+| DecisionNode | False | False | Чисто детерминистический |
+| AggregateNode | False | False | Чисто детерминистический |
+ 
+### 27.3 Determinism Audit
+ 
+При каждом запуске в trace записывается `determinism_audit`:
+```json
+{
+    "kind": "determinism_audit",
+    "payload": {
+        "nodes_using_seed": ["generate", "execute"],
+        "seed_value": 0,
+        "seed_present": true
+    }
+}
+```
+ 
+### 27.4 Strict Mode
+ 
+Если `config.determinism.strict=True`:
+- Все `declared_non_deterministic=True` узлы **отклоняются** при сборке registry
+- Исключение: узлы в `mcp_allow_non_deterministic_tool_ids`
+ 
+---
+ 
+## 28. State Patch (RFC6902)
+ 
+Файл: `neuronium_agent/planning/state_patch.py`
+ 
+### 28.1 PatchOperation
+ 
+```python
+class PatchOperation(BaseModel):
+    op: Literal["add", "replace", "remove"]
+    path: str           # JSON Pointer (начинается с /)
+    value: Any = None   # Обязателен для add/replace
+```
+ 
+### 28.2 apply_patch()
+ 
+```python
+def apply_patch(
+    state: Mapping,
+    patch_ops: Sequence[PatchOperation | dict],
+) -> dict[str, Any]
+```
+ 
+Применяет RFC6902 patch к immutable state, возвращает новый dict.
+ 
+**Поддерживаемые операции:**
+- **add** — добавление нового ключа/элемента массива
+- **replace** — замена существующего значения
+- **remove** — удаление ключа/элемента
+ 
+**JSON Pointer:**
+- `/foo/bar` → `state["foo"]["bar"]`
+- `/foo/0` → `state["foo"][0]` (для массивов)
+ 
+---
+ 
+## 29. Каталог операторов
+ 
+Файл: `neuronium_agent/planning/operator_catalog.py`
+ 
+Каталог операторов определяет доступные «операторы» (примитивные действия) для динамического планировщика.
+ 
+```python
+class OperatorCatalog:
+    @classmethod
+    def default(cls) -> OperatorCatalog
+```
+ 
+**Хеш каталога** (`catalog_hash`) используется для валидации при replay — если каталог изменился, replay может быть невалиден.
+ 
+---
+ 
+## 30. Каталог моделей
+ 
+Файл: `neuronium_agent/model_catalog_defaults.py`
+ 
+### 30.1 ModelCatalogEntry
+ 
+```python
+class ModelCatalogEntry(BaseModel):
+    id: str                          # Уникальный ID (напр. "default")
+    provider: str                    # Провайдер (напр. "openai")
+    model: str                       # Модель (напр. "gpt-4.1-mini")
+    api_key_env: str                 # Env-переменная для API key
+    base_url: str | None = None      # Custom endpoint
+    description: str = ""            # Описание
+```
+ 
+### 30.2 ModelCatalogConfig
+ 
+```python
+class ModelCatalogConfig(BaseModel):
+    default_model_id: str = "default"
+    models: list[ModelCatalogEntry] = []
+```
+ 
+### 30.3 ResolvedModel
+ 
+```python
+@dataclass(frozen=True)
+class ResolvedModel:
+    model: str
+    provider: str
+    api_key_env: str
+    base_url: str | None
+```
+ 
+### 30.4 resolve_model_for_node()
+ 
+```python
+def resolve_model_for_node(
+    catalog: ModelCatalogConfig,
+    llm_config: LLMConfig,
+    model_id: str | None = None,
+    *,
+    env_get: Callable | None = None,
+) -> ResolvedModel
+```
+ 
+**Приоритет разрешения:**
+1. Явный `model_id` → ищет в каталоге
+2. `catalog.default_model_id` → ищет в каталоге
+3. Fallback → `llm_config` (provider, model, api_key_env, base_url)
+ 
+**Проверка доступности:** через `env_get(api_key_env)` — если ключ не установлен, пробует следующий вариант.
+ 
+---
+ 
+## 31. Артефакты и рендеринг
+ 
+### 31.1 render_run_artifact() — debug HTML
+ 
+Файл: `neuronium_agent/artifacts/renderer.py`
+ 
+```python
+def render_run_artifact(
+    *, data_dir, trace_id, runbook_id, objective, plan_id,
+    results: dict[str, NodeOutput],
+) -> RenderedArtifact | None
+```
+ 
+- Генерирует HTML со всеми узлами (sorted by node_id)
+- Для каждого узла: status, outputs (JSON), error, quality_signals (JSON)
+- Filename: `{timestamp}_{trace_id[:12]}_{plan_id[:24]}.html`
+- Записывает в `{data_dir}/rendered/`
+- Возвращает `None` если results пуст
+ 
+### 31.2 render_user_facing_html()
+ 
+Файл: `neuronium_agent/artifacts/user_renderer.py`
+ 
+```python
+def render_user_facing_html(
+    *, data_dir, trace_id, runbook_id, objective, plan_id,
+    results, debug_artifact_path=None,
+) -> str | None
+```
+ 
+Извлекает из results:
+- `extract_article` → title_guess, final_url
+- `draft_report` → content (summary)
+ 
+Рендерит минимальный HTML: title, metadata, source link, summary, debug link.
+ 
+### 31.3 LocalArtifactIndex — галерея
+ 
+Файл: `neuronium_agent/artifacts/local_index.py`
+ 
+```python
+class LocalArtifactIndex:
+    def __init__(self, data_dir: str)
+    def append(self, entry: LocalIndexEntry) -> None
+```
+ 
+- Ведёт JSONL-индекс: `.neuronium/rendered/index.jsonl`
+- Генерирует HTML-галерею: `.neuronium/rendered/index.html`
+- Таблица: created_at, runbook, trace_id, plan_id, objective, artifact (ссылка)
+ 
+---
+ 
+## 32. CLI-интерфейс
+ 
+Файл: `neuronium_agent/cli/main.py`
+ 
+### 32.1 Команды
+ 
+| Команда | Описание |
+|---------|----------|
+| `neuronium run "objective"` | Запуск агента с указанной целью |
+| `neuronium status <trace_id>` | Текущий статус прогона |
+| `neuronium control <trace_id> <command>` | Управляющая команда |
+| `neuronium replay <trace_id>` | Replay из trace |
+| `neuronium schema` | Вывод JSON Schema |
+| `neuronium worker` | Запуск RQ worker |
+ 
+### 32.2 Supervised Mode
+ 
+Интерактивный цикл `_interactive_supervised_loop()`:
+ 
+1. Запускает run
+2. При PAUSED: показывает вопросы для уточнения (`_print_pause_help()`)
+3. Пользователь вводит ответы
+4. Отправляет `ControlCommand(type="continue", payload={"answers": ...})`
+5. Возобновляет run
+ 
+### 32.3 Parsing ответов пользователя
+ 
+- `_question_group_from_path(path)` → группа вопроса (inputs/tool_args/root)
+- `_schema_allows_type(schema, expected)` → проверка типа в JSON Schema
+- `_parse_answer_by_question_schema(raw, question)` → парсинг ввода по схеме (array, boolean, int, number, string)
+ 
+---
+ 
+## 33. Очередь задач (Redis + RQ)
+ 
+Файл: `neuronium_agent/queue/rq_runner.py`
+ 
+### 33.1 Конфигурация
+ 
+```toml
+[queue]
+enabled = true
+backend = "rq"
+redis_url = "redis://localhost:6379/0"
+queue_name = "neuronium"
+job_timeout_seconds = 900
+result_ttl_seconds = 86400
+```
+ 
+### 33.2 Архитектура
+ 
+- Использует Python RQ (Redis Queue)
+- Worker запускается через `neuronium worker`
+- Задачи сериализуются и ставятся в Redis-очередь
+- Job timeout и result TTL настраиваются
+ 
+---
+ 
+## 34. Тестирование
+ 
+### 34.1 Общие фикстуры
+ 
+Файл: `tests/conftest.py`
+ 
+```python
+@pytest.fixture
+def tmp_dir(tmp_path) -> Path
+    # Временная директория
+ 
+@pytest.fixture
+def blob_store(tmp_dir) -> FsCasStore
+    # CAS blob store во временной директории
+ 
+@pytest.fixture
+def index_store(tmp_dir) -> SqliteIndexStore
+    # SQLite index store во временной директории
+ 
+@pytest.fixture
+def app_config(tmp_dir) -> AppConfig
+    # AppConfig с временными путями
+```
+ 
+### 34.2 Категории тестов (~50 модулей)
+ 
+| Категория | Модули | Описание |
+|-----------|--------|----------|
+| **API / E2E** | test_api, test_phase1_legacy_compat_smoke | End-to-end через replay |
+| **Executor** | test_executor_*, test_determinism | DAG execution, retry, interrupts, conditional branches |
+| **Recovery** | test_recovery_* | Classifier, policy, scope, integration |
+| **Planning** | test_docs_report_plan, test_dynamic_planner_stage, test_planner_* | DAG generation, runbooks |
+| **Storage** | test_storage, test_sqlite_thread_safety | Blob + index store |
+| **Trace** | test_replay, test_decision_record, test_checkpoints_and_control | Recording, replay, checkpoints |
+| **Config** | test_config, test_model_catalog | Config loading, model resolution |
+| **Canonical** | test_canonical, test_immutability | Determinism, JSON |
+| **Tools** | test_mcp_local_tool_node, test_artifact_tools, test_export_tools, test_web_tools | Tool dispatch |
+| **CLI** | test_cli_*, test_phase6_clarification_ux | CLI parsing, supervised mode |
+| **Memory** | test_memory_stage5 | Memory ingest + query |
+| **Verification** | test_verdict_local_fix | Critic verdicts |
+ 
+### 34.3 Replay-тесты (test_api.py)
+ 
+Pre-recorded ответы:
+```python
+_ITER1_RESPONSES = {
+    "generate": {"content": "print('Hello, World!')"},
+    "execute": {"stdout": "Hello, World!\n", "exit_code": 0},
+    "critic": {"verdict": "PASS", "evidence": [...], ...},
+}
+```
+ 
+Тесты:
+- `test_run_completes` — прогон завершается COMPLETED
+- `test_trace_events_recorded` — events содержат decision, node_start, node_end
+- `test_export_trace_jsonl/json` — экспорт работает
+- `test_artifacts_persisted` — артефакты в blob store
+- `test_get_trace_events_public_api` — публичный API
+- `test_get_latest_rendered_artifact_path` — рендеринг HTML
+ 
+---
+ 
+## 35. Зависимости
+ 
+### 35.1 Обязательные (core)
+ 
+| Пакет | Назначение |
+|-------|------------|
+| `pydantic>=2.0` | Модели данных, валидация |
+| `openai>=1.0` | OpenAI API клиент |
+| `tomli` / `tomllib` | TOML парсинг (Python 3.11+ — встроенный) |
+ 
+### 35.2 Опциональные
+ 
+| Пакет | Назначение | Когда нужен |
+|-------|------------|-------------|
+| `psycopg[binary]` | PostgreSQL driver | `index_backend = "postgres"` |
+| `rq` + `redis` | Job queue | `queue.enabled = true` |
+| `docker` | Docker SDK | `code_node.docker.enabled = true` |
+| `python-dotenv` | .env файлы | Загрузка .env |
+| `click` | CLI framework | CLI |
+| `httpx` | HTTP client | Web tools |
+| `beautifulsoup4` | HTML parsing | Web extraction |
+| `pgvector` | Vector similarity | Semantic search (pgvector) |
+ 
+### 35.3 Dev / Test
+ 
+| Пакет | Назначение |
+|-------|------------|
+| `pytest` | Тестовый фреймворк |
+| `pytest-cov` | Покрытие кода |
+| `ruff` | Линтер + форматтер |
+| `mypy` | Статический анализ типов |
+ 
+---
+ 
+## 36. Дорожная карта
+ 
+### Stage 1 (текущий) — Core Loop
+- Cognitive Core: COMMIT → EXECUTE → CONTROL → ADAPT
+- HTN Planner с шаблонными DAG
+- Autofix Demo Loop (generate → execute → critic → fix)
+- SQLite storage, FS CAS blob store
+- Trace recording + replay
+ 
+### Stage 2 — Checkpoints & Resume
+- Phase-boundary checkpoints
+- Mid-execute pause/resume
+- Supervised mode with clarification UX
+ 
+### Stage 3 — MCP + Tools
+- McpToolNode с policy enforcement
+- Local tool dispatch (fs, web, text, artifact, export)
+- Docker sandbox для CodeNode
+ 
+### Stage 4 — Dynamic Planning
+- LLM-based dynamic planner
+- Operator catalog + validation
+- HTN recursive backend
+- PlannerEscalation для unsolvable objectives
+ 
+### Stage 5 — Memory (GraphRAG-lite)
+- Chunk-based memory store
+- Keyword + semantic search
+- Evidence refs + provenance tracking
+- Memory tools (ingest, query)
+ 
+### Stage 6 — Production
+- PostgreSQL index store
+- Redis + RQ job queue
+- Model catalog with availability fallback
+- Recovery policy (B1/B2): classify → scope → decide
+ 
+### Future
+- S3 blob backend
+- Full GraphRAG with entity/relation extraction
+- Multi-agent orchestration
+- Streaming execution events
+- WebSocket control channel
+- Business critics + safety critics
+ 
+---
+ 
+*Документация сгенерирована автоматически на основе анализа исходного кода neuronium_agent v0.1.0.*
